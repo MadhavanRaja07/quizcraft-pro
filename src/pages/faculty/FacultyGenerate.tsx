@@ -42,7 +42,11 @@ export default function FacultyGenerate() {
   const onGenerate = async (values: z.infer<typeof schema>) => {
     setGenerating(true);
     try {
-      const qs = await api.generateQuestions(values);
+      const qs = await api.generateQuestions({
+        topic: values.topic,
+        difficulty: values.difficulty,
+        count: values.count,
+      });
       setQuestions(qs);
       if (!title) setTitle(`${values.topic} — ${values.difficulty}`);
       toast({ title: "Generated!", description: `${qs.length} questions ready to edit.` });
