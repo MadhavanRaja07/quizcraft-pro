@@ -35,7 +35,7 @@ export default function Signup() {
   const onSubmit = async (values: z.infer<typeof schema>) => {
     setSubmitting(true);
     try {
-      const user = await signup({ ...values, role });
+      const user = await signup({ name: values.name, email: values.email, password: values.password, role });
       toast({ title: "Account created", description: `Welcome, ${user.name}!` });
       navigate(user.role === "faculty" ? "/faculty" : "/student", { replace: true });
     } catch (err) {
