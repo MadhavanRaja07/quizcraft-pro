@@ -236,12 +236,36 @@ export const api = {
     return attempt;
   },
 
-  // ---------- AI generation (mock) ----------
+  // ---------- AI generation ----------
+  // If VITE_API_URL is set (local Express + OpenAI), call the real endpoint.
+  // Otherwise fall back to the in-browser mock so the Lovable preview still works.
   async generateQuestions(input: {
     topic: string;
     difficulty: "easy" | "medium" | "hard";
     count: number;
   }): Promise<Question[]> {
+    const apiUrl = (import.meta as any).env?.VITE_API_URL as string | undefined;
+    if (apiUrl) {
+      const session = api.getSession();
+      const res = await fetch(`${apiUrl.replace(/\/$/, "")}/ai/generate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        },
+        body: JSON.stringify(input),
+      });
+      if (!res.ok) {
+        const msg = await res.text().catch(() => "");
+        throw new Error(msg || `AI generation failed (${res.status})`);
+      }
+      const data = await res.json();
+      const raw: Array<{ text: string; options: string[]; correctIndex: number }> = Array.isArray(data)
+        ? data
+        : data.questions ?? [];
+      return raw.map((q) => ({ id: uid(), ...q }));
+    }
+
     await sleep(900);
     const { topic, difficulty, count } = input;
     const templates = [
