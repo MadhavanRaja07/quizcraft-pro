@@ -14,6 +14,8 @@ const KEYS = {
 const uid = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const API_URL = ((import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_API_URL ?? "").replace(/\/$/, "");
+const HAS_REMOTE_API = Boolean(API_URL);
 
 function read<T>(key: string, fallback: T): T {
   try {
@@ -25,6 +27,52 @@ function read<T>(key: string, fallback: T): T {
 }
 function write<T>(key: string, value: T) {
   localStorage.setItem(key, JSON.stringify(value));
+}
+
+async function readErrorMessage(res: Response) {
+  try {
+    const data = await res.json();
+    if (typeof data?.error === "string" && data.error) return data.error;
+    if (typeof data?.message === "string" && data.message) return data.message;
+  } catch {
+    try {
+      const text = await res.text();
+      if (text) return text;
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+async function requestApi<T>(path: string, init: RequestInit = {}): Promise<T> {
+  try {
+    const session = read<AuthSession | null>(KEYS.session, null);
+    const res = await fetch(`${API_URL}${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        ...(init.headers ?? {}),
+      },
+    });
+
+    if (!res.ok) {
+      const message = await readErrorMessage(res);
+      throw new Error(message || `Request failed (${res.status})`);
+    }
+
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
+  } catch (err) {
+    if (err instanceof Error) {
+      if (err.message.includes("Failed to fetch")) {
+        throw new Error("Unable to reach the local API. Make sure the Express server is running and VITE_API_URL is correct.");
+      }
+      throw err;
+    }
+    throw new Error("Unexpected API error.");
+  }
 }
 
 // ---------- Seed ----------
@@ -103,6 +151,14 @@ seed();
 // ---------- Auth ----------
 export const api = {
   async signup(input: { name: string; email: string; password: string; role: Role }): Promise<AuthSession> {
+    if (HAS_REMOTE_API) {
+      const session = await requestApi<AuthSession>("/auth/signup", {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+      write(KEYS.session, session);
+      return session;
+    }
     await sleep(400);
     const users = read<User[]>(KEYS.users, []);
     if (users.some((u) => u.email.toLowerCase() === input.email.toLowerCase())) {
@@ -126,6 +182,14 @@ export const api = {
   },
 
   async login(email: string, password: string): Promise<AuthSession> {
+    if (HAS_REMOTE_API) {
+      const session = await requestApi<AuthSession>("/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      });
+      write(KEYS.session, session);
+      return session;
+    }
     await sleep(400);
     const users = read<User[]>(KEYS.users, []);
     const user = users.find((u) => u.email.toLowerCase() === email.toLowerCase());
@@ -141,10 +205,24 @@ export const api = {
   },
 
   getSession(): AuthSession | null {
-    return read<AuthSession | null>(KEYS.session, null);
+    const session = read<AuthSession | null>(KEYS.session, null);
+    if (HAS_REMOTE_API && session?.token?.startsWith("mock.")) {
+      localStorage.removeItem(KEYS.session);
+      return null;
+    }
+    return session;
   },
 
   async updateProfile(userId: string, patch: Partial<Pick<User, "name" | "email">>): Promise<User> {
+    if (HAS_REMOTE_API) {
+      const user = await requestApi<User>("/auth/me", {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      });
+      const session = api.getSession();
+      if (session) write(KEYS.session, { ...session, user });
+      return user;
+    }
     await sleep(250);
     const users = read<User[]>(KEYS.users, []);
     const idx = users.findIndex((u) => u.id === userId);
@@ -157,6 +235,13 @@ export const api = {
   },
 
   async changePassword(userId: string, current: string, next: string): Promise<void> {
+    if (HAS_REMOTE_API) {
+      await requestApi<{ ok: true }>("/auth/change-password", {
+        method: "POST",
+        body: JSON.stringify({ current, next }),
+      });
+      return;
+    }
     await sleep(250);
     const pwd = read<Record<string, string>>(KEYS.pwd, {});
     if (pwd[userId] !== current) throw new Error("Current password is incorrect.");
@@ -244,26 +329,25 @@ export const api = {
     difficulty: "easy" | "medium" | "hard";
     count: number;
   }): Promise<Question[]> {
-    const apiUrl = (import.meta as any).env?.VITE_API_URL as string | undefined;
-    if (apiUrl) {
-      const session = api.getSession();
-      const res = await fetch(`${apiUrl.replace(/\/$/, "")}/ai/generate`, {
+    if (HAS_REMOTE_API) {
+      if (!api.getSession()) {
+        throw new Error("Please sign in again so the local API can authorize AI generation.");
+      }
+      const data = await requestApi<Array<{ text: string; options: string[]; correctIndex: number }> | { questions?: Array<{ text: string; options: string[]; correctIndex: number }> }>("/ai/generate", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
         body: JSON.stringify(input),
       });
-      if (!res.ok) {
-        const msg = await res.text().catch(() => "");
-        throw new Error(msg || `AI generation failed (${res.status})`);
-      }
-      const data = await res.json();
       const raw: Array<{ text: string; options: string[]; correctIndex: number }> = Array.isArray(data)
         ? data
         : data.questions ?? [];
-      return raw.map((q) => ({ id: uid(), ...q }));
+      return raw
+        .filter((q) => q.text?.trim() && Array.isArray(q.options) && q.options.length === 4 && Number.isInteger(q.correctIndex))
+        .map((q) => ({
+          id: uid(),
+          text: q.text.trim(),
+          options: q.options.map((option) => option.trim()),
+          correctIndex: q.correctIndex,
+        }));
     }
 
     await sleep(900);
