@@ -7,7 +7,7 @@ const router = Router();
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
 const schema = z.object({
-  topic: z.string().min(2).max(100),
+  topic: z.string().trim().min(2).max(100),
   difficulty: z.enum(["easy", "medium", "hard"]),
   count: z.number().int().min(1).max(20),
 });
@@ -19,6 +19,43 @@ const questionSchema = z.object({
 const responseSchema = z.object({
   questions: z.array(questionSchema).min(1).max(20),
 });
+
+const bannedQuestionPatterns = [
+  /\btopic\b/i,
+  /\bconcept\s*#?\d*/i,
+  /question\s*number/i,
+  /the\s+(above|subject)/i,
+  /placeholder/i,
+  /\bwhich\s+statement\s+(best\s+)?describes\b/i,
+  /\bwhich\s+option\s+is\s+most\s+accurate\b/i,
+  /\bwhat\s+is\s+the\s+main\s+idea\b/i,
+  /\bmain\s+purpose\s+of\b/i,
+  /\bwhy\s+is\s+.+\s+important\b/i,
+];
+
+function normalizeQuestion(question) {
+  const options = question.options.map((option) => option.trim());
+  const seen = new Set(options.map((option) => option.toLowerCase()));
+  if (seen.size !== 4) return null;
+
+  return {
+    text: question.text.trim().replace(/\s+/g, " "),
+    options,
+    correctIndex: question.correctIndex,
+  };
+}
+
+function isLowQuality(question, topic) {
+  const text = question.text.toLowerCase();
+  const normalizedTopic = topic.toLowerCase();
+
+  return (
+    bannedQuestionPatterns.some((pattern) => pattern.test(question.text)) ||
+    text.includes(`${normalizedTopic} is important`) ||
+    text.length < 24 ||
+    question.options.some((option) => /all of the above|none of the above|it depends|always true|never true|unrelated/i.test(option))
+  );
+}
 
 function extractJson(content) {
   const cleaned = (content ?? "")
@@ -46,19 +83,20 @@ router.post("/generate", authRequired, requireRole("faculty"), async (req, res, 
       hard: "deep reasoning, edge cases, trade-offs, or multi-step analysis",
     }[difficulty];
 
-    const prompt = `You are writing a quiz strictly about the subject: "${topic}".
+    const buildPrompt = (neededCount, previousBadQuestions = []) => `You are writing a quiz strictly about this exact topic: "${topic}".
 
-Generate EXACTLY ${count} multiple-choice questions. Difficulty target: ${difficulty} (${difficultyGuide}).
+Generate EXACTLY ${neededCount} multiple-choice questions. Difficulty target: ${difficulty} (${difficultyGuide}).
 
 HARD RULES:
-1. EVERY question must test real, factual knowledge of "${topic}" itself. If "${topic}" is a technical subject (e.g. "Operating Systems", "DBMS", "React Hooks", "Photosynthesis"), questions must reference concrete concepts, terms, algorithms, components, or facts from that subject.
-2. DO NOT produce generic questions like "What is the main idea of ${topic}?", "Which of these is related to ${topic}?", "${topic} is important because…", or any meta/placeholder wording.
-3. DO NOT use the literal words "topic", "concept #", "question number", "the subject", "the above", or "all of the above is correct".
-4. Each question has EXACTLY 4 distinct, plausible options. Exactly ONE is correct. Wrong options must be believable distractors from the same subject area, not nonsense.
-5. Vary the correctIndex across the set (do not always pick 0).
-6. Keep each question self-contained — no "refer to the previous question".
+1. Ask direct subject questions that require knowledge of "${topic}". Use named facts, components, algorithms, commands, formulas, definitions, or use-cases from that topic.
+2. NEVER ask vague template questions such as "which statement describes...", "which option is most accurate...", "what is the main idea...", "why is it important...", or "which is related to...".
+3. DO NOT use the literal words "topic", "concept #", "question number", "the subject", "the above", "all of the above", or "none of the above".
+4. Each question has EXACTLY 4 distinct, plausible options. Exactly ONE is correct. Wrong options must be believable distractors from the same subject area.
+5. Vary the correctIndex across the set.
+6. Keep each question self-contained and classroom-ready.
+${previousBadQuestions.length ? `\nThese examples were rejected because they were generic. Do not repeat this style:\n${previousBadQuestions.map((text) => `- ${text}`).join("\n")}` : ""}
 
-If "${topic}" is too vague or you do not have reliable knowledge of it, still produce real factual questions about the closest well-defined interpretation of "${topic}" — never fall back to placeholders.
+If "${topic}" is broad, choose well-known subtopics inside it and write concrete factual questions. Never fall back to placeholders.
 
 Return ONLY this JSON (no prose, no markdown):
 {
@@ -67,44 +105,49 @@ Return ONLY this JSON (no prose, no markdown):
   ]
 }`;
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      response_format: { type: "json_object" },
-      max_tokens: Math.min(4000, 500 + count * 220),
-      temperature: 0.7,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are an expert subject-matter quiz author. You produce factual, subject-specific multiple-choice questions. You never produce generic, meta, or placeholder questions. Output strict JSON only.",
-        },
-        { role: "user", content: prompt },
-      ],
-    });
+    async function generateBatch(neededCount, previousBadQuestions = []) {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        max_tokens: Math.min(4000, 500 + neededCount * 240),
+        temperature: 0.35,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a strict exam-question writer. Produce only concrete, topic-specific MCQs with plausible distractors. Reject generic wording in your own output. Output strict JSON only.",
+          },
+          { role: "user", content: buildPrompt(neededCount, previousBadQuestions) },
+        ],
+      });
 
-    const content = completion.choices[0]?.message?.content ?? "{}";
-    const parsed = responseSchema.parse(extractJson(content));
-
-    // Reject obvious generic/placeholder questions and ask the model once more if needed.
-    const lowerTopic = topic.toLowerCase();
-    const bannedPatterns = [
-      /\btopic\b/i,
-      /\bconcept\s*#?\d*/i,
-      /question\s*number/i,
-      /the\s+(above|subject)/i,
-      /placeholder/i,
-    ];
-    const looksGeneric = (q) =>
-      bannedPatterns.some((re) => re.test(q.text)) ||
-      q.text.toLowerCase().includes(`${lowerTopic} is important`) ||
-      /^what is the main idea/i.test(q.text);
-
-    const cleaned = parsed.questions.filter((q) => !looksGeneric(q));
-    if (cleaned.length === 0) {
-      return next({ status: 422, message: `AI returned only generic questions for "${topic}". Try a more specific topic (e.g. "Binary Search Trees" instead of "Trees").` });
+      const content = completion.choices[0]?.message?.content ?? "{}";
+      const parsed = responseSchema.parse(extractJson(content));
+      return parsed.questions;
     }
 
-    res.json(cleaned.slice(0, count));
+    const accepted = [];
+    const rejected = [];
+
+    for (let attempt = 0; attempt < 2 && accepted.length < count; attempt += 1) {
+      const needed = count - accepted.length;
+      const batch = await generateBatch(needed, rejected.slice(0, 5));
+      for (const question of batch) {
+        const normalized = normalizeQuestion(question);
+        if (!normalized || isLowQuality(normalized, topic)) {
+          rejected.push(question.text);
+          continue;
+        }
+        accepted.push(normalized);
+        if (accepted.length === count) break;
+      }
+    }
+
+    if (accepted.length < count) {
+      return next({ status: 422, message: `AI could not produce enough topic-specific questions for "${topic}". Try a more specific topic, such as a chapter name or subtopic.` });
+    }
+
+    res.json(accepted);
   } catch (err) { next(err); }
 });
 
