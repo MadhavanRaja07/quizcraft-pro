@@ -40,22 +40,30 @@ router.post("/generate", authRequired, requireRole("faculty"), async (req, res, 
     const { topic, difficulty, count } = schema.parse(req.body);
     if (!openai) return next({ status: 500, message: "OPENAI_API_KEY not configured" });
 
-    const prompt = `Create exactly ${count} college-level multiple-choice questions about ${topic}.
-Difficulty: ${difficulty}.
+    const difficultyGuide = {
+      easy: "recall of definitions and basic facts a beginner would know",
+      medium: "applying concepts, comparing approaches, or simple problem solving",
+      hard: "deep reasoning, edge cases, trade-offs, or multi-step analysis",
+    }[difficulty];
 
-Requirements:
-- Every question must be specifically about ${topic}, not generic study-skills or placeholder phrasing.
-- Do not mention the words "topic", "difficulty", "question number", or "concept #" in the output.
-- Each question must have exactly 4 plausible options and exactly 1 correct answer.
-- Keep wording clear, factual, and unambiguous.
-- Return only strict JSON with this shape:
+    const prompt = `You are writing a quiz strictly about the subject: "${topic}".
+
+Generate EXACTLY ${count} multiple-choice questions. Difficulty target: ${difficulty} (${difficultyGuide}).
+
+HARD RULES:
+1. EVERY question must test real, factual knowledge of "${topic}" itself. If "${topic}" is a technical subject (e.g. "Operating Systems", "DBMS", "React Hooks", "Photosynthesis"), questions must reference concrete concepts, terms, algorithms, components, or facts from that subject.
+2. DO NOT produce generic questions like "What is the main idea of ${topic}?", "Which of these is related to ${topic}?", "${topic} is important because…", or any meta/placeholder wording.
+3. DO NOT use the literal words "topic", "concept #", "question number", "the subject", "the above", or "all of the above is correct".
+4. Each question has EXACTLY 4 distinct, plausible options. Exactly ONE is correct. Wrong options must be believable distractors from the same subject area, not nonsense.
+5. Vary the correctIndex across the set (do not always pick 0).
+6. Keep each question self-contained — no "refer to the previous question".
+
+If "${topic}" is too vague or you do not have reliable knowledge of it, still produce real factual questions about the closest well-defined interpretation of "${topic}" — never fall back to placeholders.
+
+Return ONLY this JSON (no prose, no markdown):
 {
   "questions": [
-    {
-      "text": "string",
-      "options": ["string", "string", "string", "string"],
-      "correctIndex": 0
-    }
+    { "text": "…", "options": ["…","…","…","…"], "correctIndex": 0 }
   ]
 }`;
 
@@ -63,16 +71,40 @@ Requirements:
       model: "gpt-4o-mini",
       response_format: { type: "json_object" },
       max_tokens: Math.min(4000, 500 + count * 220),
-      temperature: 0.4,
+      temperature: 0.7,
       messages: [
-        { role: "system", content: "You generate accurate, topic-specific quiz questions for faculty. Return JSON only." },
+        {
+          role: "system",
+          content:
+            "You are an expert subject-matter quiz author. You produce factual, subject-specific multiple-choice questions. You never produce generic, meta, or placeholder questions. Output strict JSON only.",
+        },
         { role: "user", content: prompt },
       ],
     });
 
     const content = completion.choices[0]?.message?.content ?? "{}";
     const parsed = responseSchema.parse(extractJson(content));
-    res.json(parsed.questions.slice(0, count));
+
+    // Reject obvious generic/placeholder questions and ask the model once more if needed.
+    const lowerTopic = topic.toLowerCase();
+    const bannedPatterns = [
+      /\btopic\b/i,
+      /\bconcept\s*#?\d*/i,
+      /question\s*number/i,
+      /the\s+(above|subject)/i,
+      /placeholder/i,
+    ];
+    const looksGeneric = (q) =>
+      bannedPatterns.some((re) => re.test(q.text)) ||
+      q.text.toLowerCase().includes(`${lowerTopic} is important`) ||
+      /^what is the main idea/i.test(q.text);
+
+    const cleaned = parsed.questions.filter((q) => !looksGeneric(q));
+    if (cleaned.length === 0) {
+      return next({ status: 422, message: `AI returned only generic questions for "${topic}". Try a more specific topic (e.g. "Binary Search Trees" instead of "Trees").` });
+    }
+
+    res.json(cleaned.slice(0, count));
   } catch (err) { next(err); }
 });
 
