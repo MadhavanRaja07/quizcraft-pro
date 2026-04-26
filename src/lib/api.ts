@@ -352,31 +352,37 @@ export const api = {
 
     await sleep(900);
     const { topic, difficulty, count } = input;
+    const level = difficulty === "easy" ? "basic" : difficulty === "hard" ? "advanced" : "practical";
     const templates = [
       (i: number) => ({
-        text: `${topic}: which statement best describes concept #${i + 1}? (${difficulty})`,
+        text: `Which ${level} ${topic} detail should a learner know for case ${i + 1}?`,
         options: [
-          `A foundational principle of ${topic}.`,
-          `Unrelated to ${topic}.`,
-          `A common misconception about ${topic}.`,
-          `An advanced edge case in ${topic}.`,
+          `A correct ${topic} principle used in real examples`,
+          `A distractor from a different part of the syllabus`,
+          `A misleading shortcut that causes errors`,
+          `A term that sounds similar but has another meaning`,
         ],
-        correctIndex: 0,
+        correctIndex: i % 4,
       }),
       (i: number) => ({
-        text: `In ${topic}, which option is most accurate for scenario ${i + 1}?`,
+        text: `When applying ${topic}, what is the expected result in example ${i + 1}?`,
         options: [
-          `It depends on context.`,
-          `Always true in ${topic}.`,
-          `Never true in ${topic}.`,
-          `Only true at scale.`,
+          `The standard ${topic} result for that example`,
+          `A result caused by using the wrong rule`,
+          `An unrelated output from another topic`,
+          `A common beginner misconception`,
         ],
-        correctIndex: 1,
+        correctIndex: (i + 1) % 4,
       }),
     ];
     return Array.from({ length: count }, (_, i) => {
-      const t = templates[i % templates.length](i);
-      return { id: uid(), ...t };
+      const generated = templates[i % templates.length](i);
+      const correct = generated.options[0];
+      const options = [...generated.options];
+      const targetIndex = generated.correctIndex;
+      options[0] = options[targetIndex];
+      options[targetIndex] = correct;
+      return { id: uid(), text: generated.text, options, correctIndex: targetIndex };
     });
   },
 };
